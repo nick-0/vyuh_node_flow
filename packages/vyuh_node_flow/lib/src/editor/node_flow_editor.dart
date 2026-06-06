@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart' hide HitTestResult;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -306,6 +307,20 @@ class NodeFlowEditor<T, C> extends StatefulWidget {
 class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
     with TickerProviderStateMixin, ViewportAnimationMixin {
   late final TransformationController _transformationController;
+  // Keeps the canvas subtree (and its state, e.g. a focused TextField) alive when
+  // we swap the InteractiveViewer for a plain Transform while the canvas is locked.
+  final GlobalKey _canvasContentKey = GlobalKey();
+  // Drives the InteractiveViewer↔Transform swap for text editing through a mobx
+  // observable instead of setState. Read inside the canvas Observer, a change
+  // rebuilds only that Observer (build phase) — exactly like canvasLocked — so
+  // reparenting the GlobalKey content happens in build, never inside the enclosing
+  // LayoutBuilder's layout pass (illegal when the focused field has an active
+  // text-selection OverlayPortal). setState instead marked the LayoutBuilder
+  // _needsBuild, deferring the reparent INTO layout — the crash this avoids.
+  final Observable<bool> _editingText = Observable<bool>(false);
+  // Cached keyboard visibility (from didChangeDependencies) so the swap builder
+  // never reads MediaQuery directly.
+  bool _keyboardVisible = false;
   final List<ReactionDisposer> _disposers = [];
   bool _isSyncingViewportFromTransform = false;
 
@@ -438,6 +453,11 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
     // Register keyboard handler for shift key cursor changes
     HardwareKeyboard.instance.addHandler(_handleKeyEvent);
 
+    // React to focus changes so the InteractiveViewer/Transform swap can engage
+    // the instant a text field gains focus (immediate, unlike the keyboard insets
+    // which lag behind) — see [_updateEditingText].
+    FocusManager.instance.addListener(_onFocusChange);
+
     // Provide transformation controller to debug extension for layer rendering
     widget.controller.debug?.setTransformationController(
       _transformationController,
@@ -508,6 +528,16 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
         widget.theme.connectionTheme.animationEffect) {
       _updateAnimationController();
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Track keyboard visibility here (subscribes to MediaQuery) instead of reading
+    // it inside the swap builder; a change republishes [_editingText] via the
+    // notifier, so the swap's content reparent stays in the build phase.
+    _keyboardVisible = MediaQuery.viewInsetsOf(context).bottom > 0;
+    _updateEditingText();
   }
 
   /// Collects plugin layers for the given position relative to a core layer.
@@ -587,6 +617,48 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
                           builder: (context, child) {
                             // When canvas is locked, disable both pan and zoom
                             final isLocked = widget.controller.canvasLocked;
+                            // Also bypass the InteractiveViewer while editing a
+                            // node's text field. Driven by a mobx observable
+                            // (_editingText, updated on focus/keyboard changes) so
+                            // reading it here makes THIS Observer rebuild in the
+                            // build phase — keeping the canvas reparent out of the
+                            // LayoutBuilder's layout pass. Kept engaged the WHOLE
+                            // editing session so a touch-release rebuild can't
+                            // dismiss the just-made text selection.
+                            final editingText = _editingText.value;
+                            // The InteractiveViewer→Transform swap is a TOUCH-ONLY
+                            // workaround. InteractiveViewer always keeps a
+                            // ScaleGestureRecognizer in the arena (even with pan/scale
+                            // disabled), which steals long-press text selection from a
+                            // TextField in a node; for touch we drop to a bare
+                            // Transform (no gesture detector → descendant gestures
+                            // win), kept in sync with autopan by the AnimatedBuilder.
+                            // On DESKTOP we NEVER swap: the upstream package already
+                            // pans/zooms on desktop with the InteractiveViewer kept and
+                            // gated by isLocked, and swapping would reparent the
+                            // GlobalKey content while a mouse-hover Tooltip
+                            // OverlayPortal is active — illegal inside the enclosing
+                            // LayoutBuilder's layout pass (the Linux-only crash).
+                            if (_isTouchPlatform && (isLocked || editingText)) {
+                              return ClipRect(
+                                child: AnimatedBuilder(
+                                  animation: _transformationController,
+                                  child: child,
+                                  builder: (context, child) => OverflowBox(
+                                    alignment: Alignment.topLeft,
+                                    minWidth: 0,
+                                    minHeight: 0,
+                                    maxWidth: double.infinity,
+                                    maxHeight: double.infinity,
+                                    child: Transform(
+                                      transform:
+                                          _transformationController.value,
+                                      child: child,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }
                             return InteractiveViewer(
                               transformationController:
                                   _transformationController,
@@ -608,167 +680,170 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
                               child: child,
                             );
                           },
-                          child: UnboundedSizedBox(
-                            width: constraints.maxWidth,
-                            height: constraints.maxHeight,
-                            child: UnboundedStack(
-                              clipBehavior: Clip.none,
-                              children: [
-                                // Extension layers: before grid
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.grid,
-                                  LayerRelation.before,
-                                ),
+                          child: KeyedSubtree(
+                            key: _canvasContentKey,
+                            child: UnboundedSizedBox(
+                              width: constraints.maxWidth,
+                              height: constraints.maxHeight,
+                              child: UnboundedStack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  // Extension layers: before grid
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.grid,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Background grid
-                                GridLayer(
-                                  controller: widget.controller,
-                                  theme: theme,
-                                  transformationController:
-                                      _transformationController,
-                                ),
+                                  // Background grid
+                                  GridLayer(
+                                    controller: widget.controller,
+                                    theme: theme,
+                                    transformationController:
+                                        _transformationController,
+                                  ),
 
-                                // Extension layers: after grid, before backgroundNodes
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.grid,
-                                  LayerRelation.after,
-                                ),
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.backgroundNodes,
-                                  LayerRelation.before,
-                                ),
+                                  // Extension layers: after grid, before backgroundNodes
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.grid,
+                                    LayerRelation.after,
+                                  ),
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.backgroundNodes,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Background nodes (GroupNode) - drag handled via NodeWidget
-                                NodesLayer.background(
-                                  widget.controller,
-                                  widget.nodeBuilder,
-                                  portBuilder: widget.portBuilder,
-                                  thumbnailBuilder: widget.thumbnailBuilder,
-                                  onNodeTap: _handleNodeTap,
-                                  onNodeDoubleTap: _handleNodeDoubleTap,
-                                  onNodeContextMenu: _handleNodeContextMenu,
-                                  onNodeMouseEnter: _handleNodeMouseEnter,
-                                  onNodeMouseLeave: _handleNodeMouseLeave,
-                                  onPortContextMenu: _handlePortContextMenu,
-                                  portSnapDistance: widget
-                                      .controller
-                                      .config
-                                      .portSnapDistance
-                                      .value,
-                                ),
+                                  // Background nodes (GroupNode) - drag handled via NodeWidget
+                                  NodesLayer.background(
+                                    widget.controller,
+                                    widget.nodeBuilder,
+                                    portBuilder: widget.portBuilder,
+                                    thumbnailBuilder: widget.thumbnailBuilder,
+                                    onNodeTap: _handleNodeTap,
+                                    onNodeDoubleTap: _handleNodeDoubleTap,
+                                    onNodeContextMenu: _handleNodeContextMenu,
+                                    onNodeMouseEnter: _handleNodeMouseEnter,
+                                    onNodeMouseLeave: _handleNodeMouseLeave,
+                                    onPortContextMenu: _handlePortContextMenu,
+                                    portSnapDistance: widget
+                                        .controller
+                                        .config
+                                        .portSnapDistance
+                                        .value,
+                                  ),
 
-                                // Extension layers: after backgroundNodes, before connections
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.backgroundNodes,
-                                  LayerRelation.after,
-                                ),
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.connections,
-                                  LayerRelation.before,
-                                ),
+                                  // Extension layers: after backgroundNodes, before connections
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.backgroundNodes,
+                                    LayerRelation.after,
+                                  ),
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.connections,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Connections
-                                ConnectionsLayer<T, C>(
-                                  controller: widget.controller,
-                                  animation: _connectionAnimationController,
-                                  connectionStyleBuilder:
-                                      widget.connectionStyleBuilder,
-                                ),
+                                  // Connections
+                                  ConnectionsLayer<T, C>(
+                                    controller: widget.controller,
+                                    animation: _connectionAnimationController,
+                                    connectionStyleBuilder:
+                                        widget.connectionStyleBuilder,
+                                  ),
 
-                                // Extension layers: after connections, before connectionLabels
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.connections,
-                                  LayerRelation.after,
-                                ),
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.connectionLabels,
-                                  LayerRelation.before,
-                                ),
+                                  // Extension layers: after connections, before connectionLabels
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.connections,
+                                    LayerRelation.after,
+                                  ),
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.connectionLabels,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Connection labels
-                                ConnectionLabelsLayer<T>(
-                                  controller: widget.controller,
-                                  labelBuilder: widget.labelBuilder,
-                                ),
+                                  // Connection labels
+                                  ConnectionLabelsLayer<T>(
+                                    controller: widget.controller,
+                                    labelBuilder: widget.labelBuilder,
+                                  ),
 
-                                // Extension layers: after connectionLabels, before middleNodes
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.connectionLabels,
-                                  LayerRelation.after,
-                                ),
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.middleNodes,
-                                  LayerRelation.before,
-                                ),
+                                  // Extension layers: after connectionLabels, before middleNodes
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.connectionLabels,
+                                    LayerRelation.after,
+                                  ),
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.middleNodes,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Middle layer nodes (regular nodes)
-                                NodesLayer.middle(
-                                  widget.controller,
-                                  widget.nodeBuilder,
-                                  portBuilder: widget.portBuilder,
-                                  thumbnailBuilder: widget.thumbnailBuilder,
-                                  onNodeTap: _handleNodeTap,
-                                  onNodeDoubleTap: _handleNodeDoubleTap,
-                                  onNodeContextMenu: _handleNodeContextMenu,
-                                  onNodeMouseEnter: _handleNodeMouseEnter,
-                                  onNodeMouseLeave: _handleNodeMouseLeave,
-                                  onPortContextMenu: _handlePortContextMenu,
-                                  portSnapDistance: widget
-                                      .controller
-                                      .config
-                                      .portSnapDistance
-                                      .value,
-                                ),
+                                  // Middle layer nodes (regular nodes)
+                                  NodesLayer.middle(
+                                    widget.controller,
+                                    widget.nodeBuilder,
+                                    portBuilder: widget.portBuilder,
+                                    thumbnailBuilder: widget.thumbnailBuilder,
+                                    onNodeTap: _handleNodeTap,
+                                    onNodeDoubleTap: _handleNodeDoubleTap,
+                                    onNodeContextMenu: _handleNodeContextMenu,
+                                    onNodeMouseEnter: _handleNodeMouseEnter,
+                                    onNodeMouseLeave: _handleNodeMouseLeave,
+                                    onPortContextMenu: _handlePortContextMenu,
+                                    portSnapDistance: widget
+                                        .controller
+                                        .config
+                                        .portSnapDistance
+                                        .value,
+                                  ),
 
-                                // Extension layers: after middleNodes, before foregroundNodes
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.middleNodes,
-                                  LayerRelation.after,
-                                ),
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.foregroundNodes,
-                                  LayerRelation.before,
-                                ),
+                                  // Extension layers: after middleNodes, before foregroundNodes
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.middleNodes,
+                                    LayerRelation.after,
+                                  ),
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.foregroundNodes,
+                                    LayerRelation.before,
+                                  ),
 
-                                // Foreground nodes (CommentNode) - drag handled via NodeWidget
-                                NodesLayer.foreground(
-                                  widget.controller,
-                                  widget.nodeBuilder,
-                                  portBuilder: widget.portBuilder,
-                                  thumbnailBuilder: widget.thumbnailBuilder,
-                                  onNodeTap: _handleNodeTap,
-                                  onNodeDoubleTap: _handleNodeDoubleTap,
-                                  onNodeContextMenu: _handleNodeContextMenu,
-                                  onNodeMouseEnter: _handleNodeMouseEnter,
-                                  onNodeMouseLeave: _handleNodeMouseLeave,
-                                  onPortContextMenu: _handlePortContextMenu,
-                                  portSnapDistance: widget
-                                      .controller
-                                      .config
-                                      .portSnapDistance
-                                      .value,
-                                ),
+                                  // Foreground nodes (CommentNode) - drag handled via NodeWidget
+                                  NodesLayer.foreground(
+                                    widget.controller,
+                                    widget.nodeBuilder,
+                                    portBuilder: widget.portBuilder,
+                                    thumbnailBuilder: widget.thumbnailBuilder,
+                                    onNodeTap: _handleNodeTap,
+                                    onNodeDoubleTap: _handleNodeDoubleTap,
+                                    onNodeContextMenu: _handleNodeContextMenu,
+                                    onNodeMouseEnter: _handleNodeMouseEnter,
+                                    onNodeMouseLeave: _handleNodeMouseLeave,
+                                    onPortContextMenu: _handlePortContextMenu,
+                                    portSnapDistance: widget
+                                        .controller
+                                        .config
+                                        .portSnapDistance
+                                        .value,
+                                  ),
 
-                                // Extension layers: after foregroundNodes
-                                // Note: SnapLinesLayer and DebugLayersStack are now provided
-                                // via LayerProvider by their respective extensions
-                                ..._getPluginLayers(
-                                  context,
-                                  NodeFlowLayer.foregroundNodes,
-                                  LayerRelation.after,
-                                ),
-                              ],
+                                  // Extension layers: after foregroundNodes
+                                  // Note: SnapLinesLayer and DebugLayersStack are now provided
+                                  // via LayerProvider by their respective extensions
+                                  ..._getPluginLayers(
+                                    context,
+                                    NodeFlowLayer.foregroundNodes,
+                                    LayerRelation.after,
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -973,6 +1048,7 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
   void dispose() {
     // Remove keyboard handler
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    FocusManager.instance.removeListener(_onFocusChange);
 
     // Remove transform listener before disposing
     _transformationController.removeListener(_syncViewportFromTransform);
@@ -989,6 +1065,55 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
     // Note: Controller disposal is handled by whoever created the controller,
     // not by this widget
     super.dispose();
+  }
+
+  void _onFocusChange() {
+    // Publish the editing state via the notifier (NOT setState) so the swap's
+    // content reparent runs in the build phase, not layout — see [_editingText].
+    _updateEditingText();
+  }
+
+  /// Whether the user is currently editing a node's text field. While editing we
+  /// keep the plain-Transform path (no InteractiveViewer gestures) so text
+  /// selection works AND the swap doesn't flip back on touch-release (which would
+  /// dismiss the selection). Uses focus (immediate) OR the keyboard insets
+  /// (fallback, cached in [_keyboardVisible]). In this editor, any non-canvas
+  /// primary focus is a form field. Read live by the tap-focus guard; published to
+  /// the [_editingText] observable (which drives the swap) by [_updateEditingText].
+  bool get _isEditingNodeText {
+    // TOUCH ONLY. The sticky editing swap exists because, after a long-press
+    // selection, the finger lifts (releasing canvasLocked) yet the keyboard and
+    // selection must persist — so we hold the InteractiveViewer out by focus. On
+    // desktop none of that applies: text selection is a click-drag, during which
+    // the pointer-down canvasLocked swap already gives the field a recognizer-free
+    // Transform path; a merely-focused field must NOT reparent the canvas, because
+    // its hover Tooltip / selection OverlayPortal would reactivate during the
+    // enclosing LayoutBuilder's layout pass and throw. That reparent-in-layout is
+    // why this crashed on Linux/desktop but not on touch (no mouse hover there).
+    if (!_isTouchPlatform) return false;
+    if (_keyboardVisible) return true;
+    final focus = FocusManager.instance.primaryFocus;
+    return focus != null &&
+        focus != widget.controller.canvasFocusNode &&
+        focus.context != null;
+  }
+
+  /// Whether the host is a touch platform (where the sticky editing swap is
+  /// needed). Desktop uses the pointer-down canvasLocked swap instead.
+  bool get _isTouchPlatform =>
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.fuchsia;
+
+  /// Publishes [_isEditingNodeText] to the [_editingText] observable so the canvas
+  /// Observer re-evaluates the InteractiveViewer/Transform swap in the build phase
+  /// (never inside the LayoutBuilder's layout pass).
+  void _updateEditingText() {
+    if (!mounted) return;
+    final editing = _isEditingNodeText;
+    if (_editingText.value != editing) {
+      runInAction(() => _editingText.value = editing);
+    }
   }
 
   // Event handlers
@@ -1060,9 +1185,7 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
     // We don't call setViewport here - the listener is the authoritative source.
 
     // Fire viewport move event with current viewport state
-    widget.controller.events.viewport?.onMove?.call(
-      widget.controller.viewport,
-    );
+    widget.controller.events.viewport?.onMove?.call(widget.controller.viewport);
   }
 
   void _onInteractionEnd(ScaleEndDetails details) {

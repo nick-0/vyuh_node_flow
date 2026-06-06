@@ -1,5 +1,6 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../graph/coordinates.dart';
@@ -339,6 +340,31 @@ class _ElementScopeState extends State<ElementScope> with AutoPanMixin {
         event.kind == PointerDeviceKind.invertedStylus;
   }
 
+  /// Whether [globalPosition] lands on an interactive child that must own the
+  /// touch rather than have it hijacked into a node drag:
+  ///   * a scrollable viewport ([RenderAbstractViewport], e.g. a ListView
+  ///     embedded inside a node), or
+  ///   * an editable text field ([RenderEditable]) — so long-press selection,
+  ///     the selection handles and the magnifier keep working.
+  /// The editor canvas uses an [InteractiveViewer] (not a render viewport), so
+  /// it never matches here.
+  bool _pointerOverInteractiveChild(Offset globalPosition) {
+    if (!mounted) return false;
+    final result = HitTestResult();
+    WidgetsBinding.instance.hitTestInView(
+      result,
+      globalPosition,
+      View.of(context).viewId,
+    );
+    for (final entry in result.path) {
+      final target = entry.target;
+      if (target is RenderAbstractViewport || target is RenderEditable) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // ---------------------------------------------------------------------------
   // AutoPanMixin Implementation
   // ---------------------------------------------------------------------------
@@ -560,6 +586,12 @@ class _ElementScopeState extends State<ElementScope> with AutoPanMixin {
               !widget.shouldCaptureTouch!(event.localPosition)) {
             return;
           }
+          // If the touch lands on an interactive child (a scrollable, or a text
+          // field — for long-press selection), let that child own the gesture
+          // instead of dragging the node.
+          if (_pointerOverInteractiveChild(event.position)) {
+            return;
+          }
           // Pre-lock the canvas on touch down so the canvas doesn't pan
           // while we decide whether this is a tap or a drag.
           if (widget.createSession != null && _session == null) {
@@ -602,6 +634,25 @@ class _ElementScopeState extends State<ElementScope> with AutoPanMixin {
                   ? 0.0
                   : kTouchSlop;
           if ((event.localPosition - startLocal).distance < slop) {
+            return;
+          }
+          // If, by the time the drag actually starts, the pointer is over an
+          // interactive child (scrollable or text field), abandon the node-drag
+          // capture so that child can take over. Covers the case where
+          // pointer-down began outside it (e.g. on a focused field's selection
+          // overlay) and the finger then moved onto it — e.g. dragging a text
+          // selection handle.
+          if (_pointerOverInteractiveChild(event.position)) {
+            if (_preDragLock && !_isDragging) {
+              _session?.end();
+              _session = null;
+              _preDragLock = false;
+            }
+            _touchPointerId = null;
+            _touchStartLocal = null;
+            _touchStartGlobal = null;
+            _lastTouchLocal = null;
+            _touchDragStarted = false;
             return;
           }
           _touchDragStarted = true;
